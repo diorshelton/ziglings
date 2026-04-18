@@ -75,6 +75,8 @@ pub const Exercise = struct {
     /// Hint to the user, why this has been skipped
     skip_hint: ?[]const u8 = null,
 
+    timestamp: bool = false,
+
     /// Returns the name of the main file with .zig stripped.
     pub fn name(self: Exercise) []const u8 {
         return std.fs.path.stem(self.main_file);
@@ -203,7 +205,8 @@ pub fn build(b: *Build) !void {
             break :blk seed;
         });
         const rnd = prng.random();
-        const ex = exercises[rnd.intRangeLessThan(usize, 0, exercises.len)];
+        const num = rnd.intRangeLessThan(usize, 0, exercises.len);
+        const ex = exercises[num];
 
         print("random exercise: {s}\n", .{ex.main_file});
 
@@ -268,11 +271,9 @@ pub fn build(b: *Build) !void {
 
         const progress_file_size = try progress_file.length(io);
 
-        var gpa = std.heap.DebugAllocator(.{}){};
-        defer _ = gpa.deinit();
-        const allocator = gpa.allocator();
-        const contents = try allocator.alloc(u8, progress_file_size);
-        defer allocator.free(contents);
+        var gpa = b.allocator;
+        const contents = try gpa.alloc(u8, progress_file_size);
+        defer gpa.free(contents);
         var file_buffer: [1024]u8 = undefined;
         var file_reader = progress_file.reader(io, &file_buffer);
         // try file_reader.interface.readSliceAll(contents);
@@ -344,6 +345,26 @@ const ZiglingStep = struct {
         return self;
     }
 
+    fn printProgress(num: usize, max: usize) void {
+        const bar_width: u32 = 60;
+
+        const filled_len_u64 = (@as(u64, num) * bar_width) / max;
+        const filled_len = @as(u32, @intCast(filled_len_u64));
+
+        var bar_buf: [bar_width]u8 = undefined;
+
+        for (0..bar_width) |n| {
+            const ord = std.math.order(n, filled_len);
+            bar_buf[n] = switch (ord) {
+                .lt => '#',
+                .eq => '>',
+                .gt => '-',
+            };
+        }
+
+        std.debug.print("\rProgress: [{s}]  {d}/{d}\n\n", .{ &bar_buf, num, max });
+    }
+
     fn make(step: *Step, options: Step.MakeOptions) !void {
         // NOTE: Using exit code 2 will prevent the Zig compiler to print the message:
         // "error: the following build command failed with exit code 1:..."
@@ -358,6 +379,9 @@ const ZiglingStep = struct {
             print("\n\n", .{});
             return;
         }
+
+        // Progess
+        printProgress(self.exercise.number(), exercises.len - 1);
 
         const exe_path = self.compile(options.progress_node) catch {
             self.printErrors();
@@ -386,6 +410,7 @@ const ZiglingStep = struct {
     fn run(self: *ZiglingStep, exe_path: []const u8, _: std.Progress.Node) !void {
         resetLine();
         const b = self.step.owner;
+        const gpa = b.allocator;
         const io = b.graph.io;
 
         print("Checking: {s}\n", .{self.exercise.main_file});
@@ -393,7 +418,7 @@ const ZiglingStep = struct {
         // Allow up to 1 MB of stdout capture.
         const max_output_bytes = 1 * 1024 * 1024;
 
-        const result = Process.run(b.allocator, io, .{
+        const result = Process.run(gpa, io, .{
             .argv = &.{exe_path},
             .cwd = .{ .path = b.build_root.path.? },
             .stdout_limit = .limited(max_output_bytes),
@@ -411,6 +436,7 @@ const ZiglingStep = struct {
 
     fn check_output(self: *ZiglingStep, result: Process.RunResult) !void {
         const b = self.step.owner;
+        const gpa = b.allocator;
         const io = b.graph.io;
 
         // Make sure it exited cleanly.
@@ -434,12 +460,40 @@ const ZiglingStep = struct {
         else
             result.stderr;
 
-        // Validate the output.
         // NOTE: exercise.output can never contain a CR character.
         // See https://ziglang.org/documentation/master/#Source-Encoding.
-        const output = trimLines(b.allocator, raw_output) catch @panic("OOM");
-        const exercise_output = self.exercise.output;
-        if (!std.mem.eql(u8, output, self.exercise.output)) {
+        const output = trimLines(gpa, raw_output) catch @panic("OOM");
+
+        // Validate the output.
+        var exercise_output = self.exercise.output;
+
+        // Insert timestamp for exercise 85
+        if (self.exercise.timestamp) {
+
+            // Compare timestamp from exercise with now, diff < 5 seconds is valid
+            var ts_buf: [20]u8 = undefined;
+            const ts_slice = output[14..24];
+            const ts_value = try std.fmt.parseInt(i64, ts_slice, 10);
+            const ts_build = std.Io.Timestamp.now(io, .real).toSeconds();
+            const ts_diff = @abs(ts_build - ts_value);
+            const timestamp = std.fmt.bufPrint(&ts_buf, "{}", .{if (ts_diff < 5) ts_value else ts_build}) catch unreachable;
+
+            // Insert timestamp into check string
+            var buf: [100]u8 = undefined;
+            const prefix_len = 14;
+            const placeholder_len = 11;
+
+            @memcpy(buf[0..prefix_len], exercise_output[0..prefix_len]);
+            @memcpy(buf[prefix_len..][0..timestamp.len], timestamp);
+            const suffix = exercise_output[prefix_len + placeholder_len ..];
+            const suffix_dest_start = prefix_len + timestamp.len;
+            @memcpy(buf[suffix_dest_start..][0..suffix.len], suffix);
+
+            const total_len = prefix_len + timestamp.len + suffix.len;
+            exercise_output = buf[0..total_len];
+        }
+
+        if (!std.mem.eql(u8, output, exercise_output)) {
             const red = red_bold_text;
             const reset = reset_text;
 
@@ -456,8 +510,8 @@ const ZiglingStep = struct {
             , .{ red, reset, exercise_output, red, reset, output, red, reset });
         }
 
-        const progress = try std.fmt.allocPrint(b.allocator, "{d}", .{self.exercise.number()});
-        defer b.allocator.free(progress);
+        const progress = try std.fmt.allocPrint(gpa, "{d}", .{self.exercise.number()});
+        defer gpa.free(progress);
 
         const file = try std.Io.Dir.cwd().createFile(
             io,
@@ -496,43 +550,44 @@ const ZiglingStep = struct {
         print("Compiling: {s}\n", .{self.exercise.main_file});
 
         const b = self.step.owner;
+        const gpa = b.allocator;
         const exercise_path = self.exercise.main_file;
-        const path = join(b.allocator, &.{ self.work_path, exercise_path }) catch
+        const path = join(gpa, &.{ self.work_path, exercise_path }) catch
             @panic("OOM");
 
-        var zig_args = std.array_list.Managed([]const u8).init(b.allocator);
-        defer zig_args.deinit();
+        var zig_args = std.ArrayList([]const u8).initCapacity(gpa, 10) catch @panic("OOM");
+        defer zig_args.deinit(gpa);
 
-        zig_args.append(b.graph.zig_exe) catch @panic("OOM");
+        zig_args.append(gpa, b.graph.zig_exe) catch @panic("OOM");
 
         const cmd = switch (self.exercise.kind) {
             .exe => "build-exe",
             .@"test" => "test",
         };
-        zig_args.append(cmd) catch @panic("OOM");
+        zig_args.append(gpa, cmd) catch @panic("OOM");
 
         // Enable C support for exercises that use C functions.
         if (self.exercise.link_libc) {
-            zig_args.append("-lc") catch @panic("OOM");
-            zig_args.append("-fllvm") catch @panic("OOM");
+            zig_args.append(gpa, "-lc") catch @panic("OOM");
+            zig_args.append(gpa, "-fllvm") catch @panic("OOM");
         }
 
         if (b.reference_trace) |rt| {
-            zig_args.append(b.fmt("-freference-trace={}", .{rt})) catch @panic("OOM");
+            zig_args.append(gpa, b.fmt("-freference-trace={}", .{rt})) catch @panic("OOM");
         }
 
-        zig_args.append(b.pathFromRoot(path)) catch @panic("OOM");
+        zig_args.append(gpa, b.pathFromRoot(path)) catch @panic("OOM");
 
-        zig_args.append("--cache-dir") catch @panic("OOM");
-        zig_args.append(b.pathFromRoot(b.cache_root.path.?)) catch @panic("OOM");
+        zig_args.append(gpa, "--cache-dir") catch @panic("OOM");
+        zig_args.append(gpa, b.pathFromRoot(b.cache_root.path.?)) catch @panic("OOM");
 
-        zig_args.append("--listen=-") catch @panic("OOM");
+        zig_args.append(gpa, "--listen=-") catch @panic("OOM");
 
         //
         // NOTE: After many changes in zig build system, we need to create the cache path manually.
         // See https://github.com/ziglang/zig/pull/21115
         // Maybe there is a better way (in the future).
-        const exe_dir = try self.step.evalZigProcess(zig_args.items, prog_node, false, null, b.allocator);
+        const exe_dir = try self.step.evalZigProcess(zig_args.items, prog_node, false, null, gpa);
         const exe_name = switch (self.exercise.kind) {
             .exe => self.exercise.name(),
             .@"test" => "test",
@@ -598,21 +653,22 @@ fn resetLine() void {
 
 /// Removes trailing whitespace for each line in buf, also ensuring that there
 /// are no trailing LF characters at the end.
-pub fn trimLines(allocator: std.mem.Allocator, buf: []const u8) ![]const u8 {
-    var list = try std.array_list.Aligned(u8, null).initCapacity(allocator, buf.len);
+pub fn trimLines(gpa: std.mem.Allocator, buf: []const u8) ![]const u8 {
+    var list = try std.ArrayList(u8).initCapacity(gpa, buf.len);
+    errdefer list.deinit(gpa);
 
     var iter = std.mem.splitSequence(u8, buf, " \n");
     while (iter.next()) |line| {
         // TODO: trimming CR characters is probably not necessary.
         const data = std.mem.trimEnd(u8, line, " \r");
-        try list.appendSlice(allocator, data);
-        try list.append(allocator, '\n');
+        try list.appendSlice(gpa, data);
+        try list.append(gpa, '\n');
     }
 
-    const result = try list.toOwnedSlice(allocator); // TODO: probably not necessary
+    // Calls deinit()
+    const result = try list.toOwnedSlice(gpa);
 
-    // Remove the trailing LF character, that is always present in the exercise
-    // output.
+    // Remove the trailing LF character, that is always present in the exercise output.
     return std.mem.trimEnd(u8, result, "\n");
 }
 
@@ -698,7 +754,7 @@ const exercises = [_]Exercise{
         \\most part, you'll be taking directions from the Zig
         \\compiler itself.)
         \\
-        ,
+        , // pay attention to the comma
     },
     .{
         .main_file = "002_std.zig",
@@ -730,7 +786,7 @@ const exercises = [_]Exercise{
         \\Ziggy played guitar
         \\Jamming good with Andrew Kelley
         \\And the Spiders from Mars
-        ,
+        , // pay attention to the comma
         .hint = "Please fix the lyrics!",
     },
     .{
@@ -867,7 +923,7 @@ const exercises = [_]Exercise{
         \\  <span style="color: #00ff00">Green</span>
         \\  <span style="color: #0000ff">Blue</span>
         \\</p>
-        ,
+        , // pay attention to the comma
         .hint = "I'm feeling blue about this.",
     },
     .{
@@ -879,7 +935,7 @@ const exercises = [_]Exercise{
         .output =
         \\Character 1 - G:20 H:100 XP:10
         \\Character 2 - G:10 H:100 XP:20
-        ,
+        , // pay attention to the comma
     },
     .{
         .main_file = "039_pointers.zig",
@@ -903,7 +959,7 @@ const exercises = [_]Exercise{
         .output =
         \\Wizard (G:10 H:100 XP:20)
         \\  Mentor: Wizard (G:10000 H:100 XP:2340)
-        ,
+        , // pay attention to the comma
     },
     .{
         .main_file = "044_quiz5.zig",
@@ -947,7 +1003,7 @@ const exercises = [_]Exercise{
         .output =
         \\Hand1: A 4 K 8
         \\Hand2: 5 2 Q J
-        ,
+        , // pay attention to the comma
     },
     .{
         .main_file = "053_slices2.zig",
@@ -980,7 +1036,7 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "060_floats.zig",
-        .output = "Shuttle liftoff weight: 2032 metric tons",
+        .output = "Shuttle liftoff weight: 2.032e3 metric tons",
     },
     .{
         .main_file = "061_coercions.zig",
@@ -1043,7 +1099,10 @@ const exercises = [_]Exercise{
         .main_file = "073_comptime8.zig",
         .output = "My llama value is 25.",
     },
-    .{ .main_file = "074_comptime9.zig", .output = "My llama value is 2.", .skip = false, .skip_hint = "This is actually correct as it is. :-)" },
+    .{
+        .main_file = "074_comptime9.zig",
+        .output = "MouseLlama joins the crew!",
+    },
     .{
         .main_file = "075_quiz8.zig",
         .output = "Archer's Point--2->Bridge--1->Dogwood Grove--3->Cottage--2->East Pond--1->Fox Pond",
@@ -1078,103 +1137,123 @@ const exercises = [_]Exercise{
         .main_file = "082_anonymous_structs3.zig",
         .output =
         \\"0"(bool):true "1"(bool):false "2"(i32):42 "3"(f32):3.141592
-        ,
+        , // pay attention to the comma
         .hint = "This one is a challenge! But you have everything you need.",
     },
     .{
         .main_file = "083_anonymous_lists.zig",
         .output = "I say hello!",
     },
+    .{
+        .main_file = "084_interfaces.zig",
+        .output =
+        \\=== Doctor Zoraptera's Insect Report ===
+        \\Ant is alive.
+        \\Bee visited 17 flowers.
+        \\Grasshopper hopped 32 meters.
+        , // pay attention to the comma
+    },
 
     // Skipped because of https://github.com/ratfactor/ziglings/issues/163
     // direct link: https://github.com/ziglang/zig/issues/6025
     .{
-        .main_file = "084_async.zig",
-        .output = "foo() A",
-        .hint = "Read the facts. Use the facts.",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
+        .main_file = "085_async.zig",
+        .output = "Current time: <timestamp>s since epoch",
+        .timestamp = true,
     },
     .{
-        .main_file = "085_async2.zig",
-        .output = "Hello async!",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
+        .main_file = "086_async2.zig",
+        .output = "Computing... The answer is: 42",
     },
     .{
-        .main_file = "086_async3.zig",
-        .output = "5 4 3 2 1",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-    .{
-        .main_file = "087_async4.zig",
-        .output = "1 2 3 4 5",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-    .{
-        .main_file = "088_async5.zig",
-        .output = "Example Title.",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-    .{
-        .main_file = "089_async6.zig",
-        .output = ".com: Example Title, .org: Example Title.",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-    .{
-        .main_file = "090_async7.zig",
-        .output = "beef? BEEF!",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-    .{
-        .main_file = "091_async8.zig",
-        .output = "ABCDEF",
-        .skip = true,
-        .skip_hint = "async has not been implemented in the current compiler version.",
-    },
-
-    .{
-        .main_file = "092_interfaces.zig",
+        .main_file = "087_async3.zig",
         .output =
-        \\Daily Insect Report:
-        \\Ant is alive.
-        \\Bee visited 17 flowers.
-        \\Grasshopper hopped 32 meters.
-        ,
+        \\1 + 2 = 3
+        \\6 * 7 = 42
+        \\Total: 45
+        , // pay attention to the comma
     },
     .{
-        .main_file = "093_hello_c.zig",
+        .main_file = "088_async4.zig",
+        .output =
+        \\Task 1 done.
+        \\Task 2 done.
+        \\Task 3 done.
+        \\All tasks finished!
+        , // pay attention to the comma
+    },
+    .{
+        .main_file = "089_async5.zig",
+        .output =
+        \\Starting long computation...
+        \\Canceling slow task...
+        \\Task was canceled, cleaning up.
+        \\Task returned: 0
+        , // pay attention to the comma
+    },
+    .{
+        .main_file = "090_async6.zig",
+        .output = "Hare: I'm fast!",
+    },
+    .{
+        .main_file = "091_async7.zig",
+        .output = "Counter: 400",
+    },
+    .{
+        .main_file = "092_async8.zig",
+        .output = "Sum of 1..10 = 55",
+    },
+    .{
+        .main_file = "093_async9.zig",
+        .output = "Worker 1 found signal start over threshold at index 12!",
+    },
+    .{
+        .main_file = "094_async10.zig",
+        .output =
+        \\Starting critical section...
+        \\Critical section completed safely.
+        \\Task result: All data saved.
+        , // pay attention to the comma
+    },
+    .{
+        .main_file = "095_quiz_async.zig",
+        .output =
+        \\=== Doctor Zoraptera's Garden Report ===
+        \\Temperature : 23C
+        \\Humidity    : 63%
+        \\Wind        : 13 km/h
+        \\Readings    : 9
+        \\Bee-friendly conditions! Expect high pollination.
+        , // pay attention to the comma
+    },
+    .{
+        .main_file = "096_hello_c.zig",
         .output = "Hello C from Zig! - C result is 17 chars written.",
         .link_libc = true,
     },
     .{
-        .main_file = "094_c_math.zig",
+        .main_file = "097_c_math.zig",
         .output = "The normalized angle of 765.2 degrees is 45.2 degrees.",
         .link_libc = true,
     },
     .{
-        .main_file = "095_for3.zig",
+        .main_file = "098_for3.zig",
         .output = "1 2 4 7 8 11 13 14 16 17 19\n1 2 3 4 5 6 7 8 9 10 11 12 13 14 15",
     },
     .{
-        .main_file = "096_memory_allocation.zig",
+        .main_file = "099_memory_allocation.zig",
         .output = "Running Average: 0.30 0.25 0.20 0.18 0.22",
     },
     .{
-        .main_file = "097_bit_manipulation.zig",
+        .main_file = "100_bit_manipulation.zig",
         .output = "x = 1011; y = 1101",
     },
     .{
-        .main_file = "098_bit_manipulation2.zig",
+        .main_file = "101_bit_manipulation2.zig",
         .output = "Is this a pangram? true!",
     },
     .{
-        .main_file = "099_formatting.zig",
+        .main_file = "102_formatting.zig",
         .output =
         \\
         \\ X |  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
@@ -1211,25 +1290,25 @@ const exercises = [_]Exercise{
         ,
     },
     .{
-        .main_file = "100_for4.zig",
+        .main_file = "103_for4.zig",
         .output = "Arrays match!",
     },
     .{
-        .main_file = "101_for5.zig",
+        .main_file = "104_for5.zig",
         .output =
         \\1. Wizard (Gold: 25, XP: 40)
         \\2. Bard (Gold: 11, XP: 17)
         \\3. Bard (Gold: 5, XP: 55)
         \\4. Warrior (Gold: 7392, XP: 21)
-        ,
+        , // pay attention to the comma
     },
     .{
-        .main_file = "102_testing.zig",
+        .main_file = "105_testing.zig",
         .output = "",
         .kind = .@"test",
     },
     .{
-        .main_file = "103_tokenization.zig",
+        .main_file = "106_tokenization.zig",
         .output =
         \\My
         \\name
@@ -1247,10 +1326,10 @@ const exercises = [_]Exercise{
         \\and
         \\despair
         \\This little poem has 15 words!
-        ,
+        , // pay attention to the comma
     },
     .{
-        .main_file = "104_threading.zig",
+        .main_file = "107_threading.zig",
         .output =
         \\Starting work...
         \\thread 1: started.
@@ -1261,35 +1340,35 @@ const exercises = [_]Exercise{
         \\thread 1: finished.
         \\thread 3: finished.
         \\Zig is cool!
-        ,
+        , // pay attention to the comma
     },
     .{
-        .main_file = "105_threading2.zig",
+        .main_file = "108_threading2.zig",
         .output = "PI ≈ 3.14159265",
     },
     .{
-        .main_file = "106_files.zig",
+        .main_file = "109_files.zig",
         .output = "Successfully wrote 18 bytes.",
     },
     .{
-        .main_file = "107_files2.zig",
+        .main_file = "110_files2.zig",
         .output =
         \\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         \\Successfully Read 18 bytes: It's zigling time!
-        ,
+        , // pay attention to the comma
     },
     .{
-        .main_file = "108_labeled_switch.zig",
+        .main_file = "111_labeled_switch.zig",
         .output = "The pull request has been merged.",
     },
     .{
-        .main_file = "109_vectors.zig",
+        .main_file = "112_vectors.zig",
         .output =
         \\Max difference (old fn): 0.014
         \\Max difference (new fn): 0.014
-        ,
+        , // pay attention to the comma
     },
-    .{ .main_file = "110_quiz9.zig", .output =
+    .{ .main_file = "113_quiz9.zig", .output =
     \\Toggle pins with XOR on PORTB
     \\-----------------------------
     \\  1100 // (initial state of PORTB)
@@ -1321,11 +1400,11 @@ const exercises = [_]Exercise{
     \\= 0110
     },
     .{
-        .main_file = "111_packed.zig",
+        .main_file = "114_packed.zig",
         .output = "",
     },
     .{
-        .main_file = "112_packed2.zig",
+        .main_file = "115_packed2.zig",
         .output = "",
     },
     .{
@@ -1334,6 +1413,6 @@ const exercises = [_]Exercise{
         \\
         \\This is the end for now!
         \\We hope you had fun and were able to learn a lot, so visit us again when the next exercises are available.
-        ,
+        , // pay attention to the comma
     },
 };
