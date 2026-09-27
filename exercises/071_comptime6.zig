@@ -12,7 +12,7 @@
 // wouldn't be allowed:
 //
 //     inline for (.{ u8, u16, u32, u64 }) |T| {
-//         print("{} ", .{@typeInfo(T).int.bits});
+//         print("{} ", .{@typeInfo(T).int.bits});ecl(MyType, "quack");
 //     }
 //
 // In the above example, we're looping over a list of types,
